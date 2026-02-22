@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+venv/
+
+# PyCharm
+.idea/
+
+# Data (NU urcăm datasetul!)
+data/raw/
+data/processed/
+
+# Results (modele mari)
+results/best_cnn.pt
+
+# OS
+.DS_Store
+Thumbs.db
