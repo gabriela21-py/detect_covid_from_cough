@@ -11,12 +11,14 @@ venv/
 # PyCharm
 .idea/
 
-# Data (NU urcăm datasetul!)
+# Data
 data/raw/
 data/processed/
 
-# Results (modele mari)
+# Results
 results/best_cnn.pt
+results/best_cnn_base_seed42.csv
+results/best_cnn_aug_seed42.csv
 
 # OS
 .DS_Store
