@@ -43,11 +43,9 @@ def predict_proba_pos(model, loader, device="cpu"):
 
 
 def best_threshold_f1(y_true, p_pos):
-    # caută pragul care maximizează F1 pentru clasa pozitivă
     best_thr = 0.5
     best_f1 = -1.0
 
-    # praguri "coarse" suficiente pentru licență
     for thr in np.linspace(0.1, 0.9, 17):
         y_pred = (p_pos >= thr).astype(int)
         cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
@@ -109,6 +107,10 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--max_seconds", type=float, default=6.0)
     parser.add_argument("--n_mels", type=int, default=64)
+
+    # NEW: augmentation on train
+    parser.add_argument("--augment", action="store_true", help="Enable waveform augmentation on TRAIN only")
+
     args = parser.parse_args()
 
     seed_everything(args.seed)
@@ -117,12 +119,33 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Device:", device)
     print("Seed:", args.seed)
+    print("Augment(train):", bool(args.augment))
 
-    train_ds = CoswaraCoughDataset(MANIFEST_CSV, "train", max_seconds=args.max_seconds, n_mels=args.n_mels)
-    val_ds   = CoswaraCoughDataset(MANIFEST_CSV, "val",   max_seconds=args.max_seconds, n_mels=args.n_mels)
-    test_ds  = CoswaraCoughDataset(MANIFEST_CSV, "test",  max_seconds=args.max_seconds, n_mels=args.n_mels)
+    # Train dataset with augmentation if --augment
+    train_ds = CoswaraCoughDataset(
+        MANIFEST_CSV,
+        "train",
+        max_seconds=args.max_seconds,
+        n_mels=args.n_mels,
+        augment=bool(args.augment),
+    )
+    # Val/Test always without augmentation
+    val_ds = CoswaraCoughDataset(
+        MANIFEST_CSV,
+        "val",
+        max_seconds=args.max_seconds,
+        n_mels=args.n_mels,
+        augment=False,
+    )
+    test_ds = CoswaraCoughDataset(
+        MANIFEST_CSV,
+        "test",
+        max_seconds=args.max_seconds,
+        n_mels=args.n_mels,
+        augment=False,
+    )
 
-    train_ld = DataLoader(train_ds, batch_size=args.batch, shuffle=True,  num_workers=0)
+    train_ld = DataLoader(train_ds, batch_size=args.batch, shuffle=True, num_workers=0)
     val_ld   = DataLoader(val_ds,   batch_size=args.batch, shuffle=False, num_workers=0)
     test_ld  = DataLoader(test_ds,  batch_size=args.batch, shuffle=False, num_workers=0)
 
@@ -140,7 +163,6 @@ def main():
         tr_loss, tr_acc = run_epoch(model, train_ld, loss_fn, optimizer, device)
         va_loss, va_acc = run_epoch(model, val_ld,   loss_fn, None,      device)
 
-        # threshold tuning pe VAL (pe probabilități)
         y_val, p_val = predict_proba_pos(model, val_ld, device)
         thr, f1pos = best_threshold_f1(y_val, p_val)
 
@@ -151,7 +173,6 @@ def main():
             f"val_best_thr={thr:.2f} val_f1(pos)={f1pos:.4f}"
         )
 
-        # best by VAL F1(pos)
         if f1pos > best_score:
             best_score = f1pos
             best_thr = thr
@@ -160,7 +181,7 @@ def main():
     print("\nSaved best model to:", best_path)
     print("Best val F1(pos):", best_score)
 
-    # TEST cu best model + thr tuned pe VAL
+    # TEST with best model + tuned threshold
     model.load_state_dict(torch.load(best_path, map_location=device))
 
     y_test, p_test = predict_proba_pos(model, test_ld, device)
@@ -178,7 +199,7 @@ def main():
     print("Confusion matrix:\n", cm)
     print(classification_report(y_test, y_pred, digits=4))
 
-    # salvare run în CSV
+    # save run
     row = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "seed": args.seed,
@@ -187,6 +208,7 @@ def main():
         "lr": args.lr,
         "max_seconds": args.max_seconds,
         "n_mels": args.n_mels,
+        "augment": int(bool(args.augment)),
         "thr_val": best_thr,
         "val_f1_pos_best": best_score,
         "test_acc": float(acc),
