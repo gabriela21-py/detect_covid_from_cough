@@ -1,97 +1,160 @@
 from __future__ import annotations
 
+import csv
 from pathlib import Path
+from typing import List, Dict, Any
+
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from src.config import RESULTS_DIR
+
+def _read_runs_csv_robust(runs_csv: Path) -> pd.DataFrame:
+    """
+    Citește runs.csv robust:
+    - întâi încearcă pd.read_csv standard
+    - dacă dă ParserError (coloane inegale), face o reparare:
+        * citește header-ul
+        * pentru fiecare linie, dacă are mai multe câmpuri decât header-ul,
+          lipește surplusul în ultimul câmp (join cu virgule)
+        * dacă are mai puține, completează cu "".
+    Returnează DataFrame.
+    """
+    try:
+        return pd.read_csv(runs_csv)
+    except Exception as e:
+        print(f"[WARN] pandas read_csv failed ({type(e).__name__}: {e}). Trying repair...")
+
+    # Reparare manuală
+    lines = runs_csv.read_text(encoding="utf-8", errors="replace").splitlines()
+    if not lines:
+        raise RuntimeError("runs.csv is empty")
+
+    # parse header safely using csv.reader
+    header = next(csv.reader([lines[0]]))
+    ncols = len(header)
+
+    fixed_rows: List[List[str]] = []
+    bad = 0
+
+    for i, line in enumerate(lines[1:], start=2):
+        if not line.strip():
+            continue
+        row = next(csv.reader([line]))
+        if len(row) == ncols:
+            fixed_rows.append(row)
+            continue
+
+        bad += 1
+        if len(row) > ncols:
+            # lipim surplusul în ultima coloană
+            keep = row[: ncols - 1]
+            tail = row[ncols - 1 :]
+            keep.append(",".join(tail))
+            fixed_rows.append(keep)
+        else:
+            # completăm lipsa
+            fixed_rows.append(row + [""] * (ncols - len(row)))
+
+    print(f"[INFO] Repair done. Bad lines fixed: {bad}")
+
+    df = pd.DataFrame(fixed_rows, columns=header)
+    return df
 
 
-def savefig(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(path, dpi=200)
-    plt.close()
+def _to_bool(x: Any) -> bool:
+    if isinstance(x, bool):
+        return x
+    s = str(x).strip().lower()
+    return s in ("1", "true", "yes", "y", "t")
 
 
-def plot_history(history_csv: Path, title_prefix: str, out_dir: Path):
-    df = pd.read_csv(history_csv)
+def plot_baseline_vs_aug(runs_csv: Path, out_dir: Path) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Loss curves
-    plt.figure()
-    plt.plot(df["epoch"], df["train_loss"])
-    plt.plot(df["epoch"], df["val_loss"])
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title(f"{title_prefix} - Loss")
-    plt.legend(["train_loss", "val_loss"])
-    savefig(out_dir / f"{title_prefix.lower().replace(' ', '_')}_loss.png")
+    df = _read_runs_csv_robust(runs_csv)
 
-    # Accuracy curves
-    plt.figure()
-    plt.plot(df["epoch"], df["train_acc"])
-    plt.plot(df["epoch"], df["val_acc"])
-    plt.xlabel("Epoch")
-    plt.ylabel("Accuracy")
-    plt.title(f"{title_prefix} - Accuracy")
-    plt.legend(["train_acc", "val_acc"])
-    savefig(out_dir / f"{title_prefix.lower().replace(' ', '_')}_acc.png")
+    # Normalizări coloane (în caz că au fost salvate ca string)
+    if "augment" in df.columns:
+        df["augment"] = df["augment"].apply(_to_bool)
 
-    # Val F1(pos) curve
-    plt.figure()
-    plt.plot(df["epoch"], df["val_f1_pos"])
-    plt.xlabel("Epoch")
-    plt.ylabel("F1 (positive class)")
-    plt.title(f"{title_prefix} - Val F1 (pos)")
-    savefig(out_dir / f"{title_prefix.lower().replace(' ', '_')}_val_f1.png")
+    # Alege metricile “best” dacă există
+    # (în funcție de ce ai logat în train_cnn)
+    candidates = [
+        "test_f1_pos",
+        "test_f1",
+        "test_acc",
+        "best_val_f1_pos",
+        "val_f1_pos",
+        "val_acc",
+    ]
+    metric = None
+    for c in candidates:
+        if c in df.columns:
+            metric = c
+            break
+    if metric is None:
+        raise RuntimeError(
+            f"Nu găsesc nicio coloană metrică în runs.csv. Am găsit coloane: {list(df.columns)}"
+        )
 
+    # Convertim metric la numeric dacă e string
+    df[metric] = pd.to_numeric(df[metric], errors="coerce")
 
-def plot_baseline_vs_aug(runs_csv: Path, out_dir: Path):
-    df = pd.read_csv(runs_csv)
+    # Grupare baseline vs aug
+    if "augment" not in df.columns:
+        raise RuntimeError("În runs.csv nu există coloana 'augment'. Nu pot compara baseline vs aug.")
 
-    # group by augment (0/1): mean metrics
-    g = df.groupby("augment")[["test_acc", "test_precision_pos", "test_recall_pos", "test_f1_pos"]].mean()
+    base = df[df["augment"] == False].copy()
+    aug = df[df["augment"] == True].copy()
 
-    # Bar chart
-    labels = ["baseline", "augmentation"]
-    x = range(4)
-    baseline = g.loc[0].values if 0 in g.index else [0, 0, 0, 0]
-    aug = g.loc[1].values if 1 in g.index else [0, 0, 0, 0]
+    # dacă există seed, păstrăm separarea pe seed
+    if "seed" in df.columns:
+        base["seed"] = pd.to_numeric(base["seed"], errors="coerce")
+        aug["seed"] = pd.to_numeric(aug["seed"], errors="coerce")
 
-    metrics = ["Accuracy", "Precision(pos)", "Recall(pos)", "F1(pos)"]
+    # Bar plot cu medie ± std (robust)
+    def summarize(d: pd.DataFrame) -> Dict[str, float]:
+        vals = d[metric].dropna().values
+        if len(vals) == 0:
+            return {"mean": float("nan"), "std": float("nan"), "n": 0}
+        return {"mean": float(pd.Series(vals).mean()), "std": float(pd.Series(vals).std(ddof=0)), "n": int(len(vals))}
 
-    plt.figure()
-    width = 0.35
-    pos0 = [i - width/2 for i in range(len(metrics))]
-    pos1 = [i + width/2 for i in range(len(metrics))]
+    s_base = summarize(base)
+    s_aug = summarize(aug)
 
-    plt.bar(pos0, baseline, width=width)
-    plt.bar(pos1, aug, width=width)
-    plt.xticks(range(len(metrics)), metrics, rotation=15)
-    plt.ylabel("Score")
-    plt.title("Baseline vs Augmentation (mean over seeds)")
-    plt.legend(labels)
-    savefig(out_dir / "baseline_vs_augmentation.png")
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    labels = [f"Baseline (n={s_base['n']})", f"Augment (n={s_aug['n']})"]
+    means = [s_base["mean"], s_aug["mean"]]
+    stds = [s_base["std"], s_aug["std"]]
+    ax.bar(labels, means, yerr=stds, capsize=6)
+    ax.set_ylabel(metric)
+    ax.set_title(f"Baseline vs Augment — {metric}")
+
+    out_path = out_dir / f"baseline_vs_aug_{metric}.png"
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+    print(f"[OK] Saved: {out_path}")
+    return out_path
 
 
 def main():
-    out_dir = RESULTS_DIR / "figures"
+    # implicit: results/runs.csv -> results/figures/
+    runs_csv = Path("results") / "runs.csv"
+    out_dir = Path("results") / "figures"
 
-    # Alege un history pentru baseline (seed 42) ca „model final” pentru curbe
-    hist_base = RESULTS_DIR / "history_base_seed42.csv"
-    if hist_base.exists():
-        plot_history(hist_base, "Baseline seed42", out_dir)
+    if not runs_csv.exists():
+        raise FileNotFoundError(f"Nu există: {runs_csv}. Verifică dacă ai results/runs.csv")
 
-    # Alege un history pentru augmentation (seed 42) dacă vrei și curbe de acolo
-    hist_aug = RESULTS_DIR / "history_aug_seed42.csv"
-    if hist_aug.exists():
-        plot_history(hist_aug, "Augmentation seed42", out_dir)
+    # În plus: salvăm și o versiune curățată pentru siguranță
+    df = _read_runs_csv_robust(runs_csv)
+    clean_path = runs_csv.with_name("runs_clean.csv")
+    df.to_csv(clean_path, index=False)
+    print(f"[OK] Wrote cleaned CSV: {clean_path}")
 
-    runs_csv = RESULTS_DIR / "runs.csv"
-    if runs_csv.exists():
-        plot_baseline_vs_aug(runs_csv, out_dir)
-
-    print("Saved figures to:", out_dir)
+    plot_baseline_vs_aug(clean_path, out_dir)
 
 
 if __name__ == "__main__":
