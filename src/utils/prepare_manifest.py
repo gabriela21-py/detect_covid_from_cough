@@ -2,30 +2,42 @@ from pathlib import Path
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
-from src.config import COSWARA_DIR, COUGH_DIR, MANIFEST_CSV, PROCESSED_DIR
+from .config import COSWARA_DIR, COUGH_DIR, MANIFEST_CSV, PROCESSED_DIR
 
 COUGH_FILES = ["cough-heavy.wav", "cough-shallow.wav"]
 
 
 def covid_label_from_status(status: str):
     """
-    1 = COVID (positive*)
-    0 = Non-COVID (healthy/negative)
-    ignorăm recovered/exposed/unknown în experimentul principal
+    1 = COVID pozitiv
+    0 = healthy / negative
+    ignorăm recovered / exposed / unknown
     """
     if not isinstance(status, str):
         return None
+
     s = status.lower().strip()
+
     if s.startswith("positive"):
         return 1
+
     if s in {"healthy", "negative", "noncovid", "non-covid"}:
         return 0
+
     return None
 
 
 def infer_subject_id(wav_path: Path) -> str:
-    # în structura Coswara, folderul părinte e ID-ul participantului
     return wav_path.parent.name
+
+
+def infer_cough_type(wav_path: Path) -> str:
+    name = wav_path.name.lower().strip()
+    if name == "cough-heavy.wav":
+        return "heavy"
+    if name == "cough-shallow.wav":
+        return "shallow"
+    return "unknown"
 
 
 def main():
@@ -34,11 +46,16 @@ def main():
         raise FileNotFoundError(f"Nu găsesc combined_data.csv în: {meta_path}")
 
     if not COUGH_DIR.exists():
-        raise FileNotFoundError(f"Nu găsesc COUGH_DIR: {COUGH_DIR}. Rulează extract_coswara_cough.py")
+        raise FileNotFoundError(
+            f"Nu găsesc COUGH_DIR: {COUGH_DIR}. Rulează extract_coswara_cough.py"
+        )
 
     df = pd.read_csv(meta_path)
+
     if "id" not in df.columns or "covid_status" not in df.columns:
-        raise ValueError("combined_data.csv trebuie să aibă coloanele 'id' și 'covid_status'.")
+        raise ValueError(
+            "combined_data.csv trebuie să aibă coloanele 'id' și 'covid_status'."
+        )
 
     id2y = {}
     for _, r in df.iterrows():
@@ -58,19 +75,34 @@ def main():
     for p in cough_files:
         sid = infer_subject_id(p)
         if sid in id2y:
-            rows.append({"subject_id": sid, "wav_path": str(p), "label": int(id2y[sid])})
+            rows.append(
+                {
+                    "subject_id": sid,
+                    "wav_path": str(p),
+                    "label": int(id2y[sid]),
+                    "cough_type": infer_cough_type(p),
+                }
+            )
 
     manifest = pd.DataFrame(rows).drop_duplicates()
-    if len(manifest) == 0:
-        raise RuntimeError("Am găsit tuse, dar nu am potrivit ID-urile cu metadata (label).")
 
-    # split pe SUBJECT (anti-leakage)
+    if len(manifest) == 0:
+        raise RuntimeError("Am găsit tuse, dar nu am potrivit ID-urile cu metadata.")
+
     subjects = manifest[["subject_id", "label"]].drop_duplicates()
+
     train_subj, test_subj = train_test_split(
-        subjects, test_size=0.15, random_state=42, stratify=subjects["label"]
+        subjects,
+        test_size=0.15,
+        random_state=42,
+        stratify=subjects["label"],
     )
+
     train_subj, val_subj = train_test_split(
-        train_subj, test_size=0.15, random_state=42, stratify=train_subj["label"]
+        train_subj,
+        test_size=0.15,
+        random_state=42,
+        stratify=train_subj["label"],
     )
 
     train_set = set(train_subj["subject_id"])
@@ -90,8 +122,24 @@ def main():
 
     print("Saved:", MANIFEST_CSV)
     print("Rows:", len(manifest))
-    print("Split:\n", manifest["split"].value_counts())
-    print("Labels:\n", manifest["label"].value_counts())
+
+    print("\nSplit:")
+    print(manifest["split"].value_counts())
+
+    print("\nLabels:")
+    print(manifest["label"].value_counts())
+
+    print("\nCough type:")
+    print(manifest["cough_type"].value_counts())
+
+    print("\nBy split x label:")
+    print(pd.crosstab(manifest["split"], manifest["label"]))
+
+    print("\nBy split x cough_type:")
+    print(pd.crosstab(manifest["split"], manifest["cough_type"]))
+
+    print("\nBy label x cough_type:")
+    print(pd.crosstab(manifest["label"], manifest["cough_type"]))
 
 
 if __name__ == "__main__":
