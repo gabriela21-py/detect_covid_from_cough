@@ -15,12 +15,10 @@ def covid_label_from_status(status: str):
     """
     if not isinstance(status, str):
         return None
-
     s = status.lower().strip()
 
     if s.startswith("positive"):
         return 1
-
     if s in {"healthy", "negative", "noncovid", "non-covid"}:
         return 0
 
@@ -31,31 +29,18 @@ def infer_subject_id(wav_path: Path) -> str:
     return wav_path.parent.name
 
 
-def infer_cough_type(wav_path: Path) -> str:
-    name = wav_path.name.lower().strip()
-    if name == "cough-heavy.wav":
-        return "heavy"
-    if name == "cough-shallow.wav":
-        return "shallow"
-    return "unknown"
-
-
 def main():
     meta_path = COSWARA_DIR / "combined_data.csv"
     if not meta_path.exists():
         raise FileNotFoundError(f"Nu găsesc combined_data.csv în: {meta_path}")
 
     if not COUGH_DIR.exists():
-        raise FileNotFoundError(
-            f"Nu găsesc COUGH_DIR: {COUGH_DIR}. Rulează extract_coswara_cough.py"
-        )
+        raise FileNotFoundError(f"Nu găsesc COUGH_DIR: {COUGH_DIR}. Rulează extract_coswara_cough.py")
 
     df = pd.read_csv(meta_path)
 
     if "id" not in df.columns or "covid_status" not in df.columns:
-        raise ValueError(
-            "combined_data.csv trebuie să aibă coloanele 'id' și 'covid_status'."
-        )
+        raise ValueError("combined_data.csv trebuie să aibă coloanele 'id' și 'covid_status'.")
 
     id2y = {}
     for _, r in df.iterrows():
@@ -80,7 +65,6 @@ def main():
                     "subject_id": sid,
                     "wav_path": str(p),
                     "label": int(id2y[sid]),
-                    "cough_type": infer_cough_type(p),
                 }
             )
 
@@ -122,24 +106,12 @@ def main():
 
     print("Saved:", MANIFEST_CSV)
     print("Rows:", len(manifest))
-
     print("\nSplit:")
     print(manifest["split"].value_counts())
-
     print("\nLabels:")
     print(manifest["label"].value_counts())
-
-    print("\nCough type:")
-    print(manifest["cough_type"].value_counts())
-
     print("\nBy split x label:")
     print(pd.crosstab(manifest["split"], manifest["label"]))
-
-    print("\nBy split x cough_type:")
-    print(pd.crosstab(manifest["split"], manifest["cough_type"]))
-
-    print("\nBy label x cough_type:")
-    print(pd.crosstab(manifest["label"], manifest["cough_type"]))
 
 
 if __name__ == "__main__":

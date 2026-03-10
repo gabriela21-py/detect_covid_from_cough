@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 import torch
@@ -42,7 +41,6 @@ class PrecomputedSpecDataset(Dataset):
             return x
 
         x = x.clone()
-
         _, n_mels, t = x.shape
 
         # time mask

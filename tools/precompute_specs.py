@@ -11,7 +11,6 @@ import argparse
 import hashlib
 from typing import List, Tuple
 
-import numpy as np
 import pandas as pd
 import soundfile as sf
 import torch
@@ -45,83 +44,47 @@ def resample_if_needed(wav: torch.Tensor, sr: int, target_sr: int) -> torch.Tens
     return torchaudio.functional.resample(wav, sr, target_sr)
 
 
-def normalize_peak(wav: torch.Tensor) -> torch.Tensor:
-    peak = wav.abs().max().item()
-    if peak > 1e-8:
-        wav = wav / peak
-    return wav
-
-
-def segment_cough_torch(
+def remove_silence(
     wav: torch.Tensor,
-    sr: int,
-    cough_padding: float = 0.2,
-    min_cough_len: float = 0.2,
-    th_l_multiplier: float = 0.1,
-    th_h_multiplier: float = 2.0,
-) -> List[torch.Tensor]:
-    """
-    Detectează segmente de tuse pe baza amplitudinii și a unor praguri adaptive.
-    Returnează o listă de segmente (1, N).
-    """
-    x = wav.squeeze(0).detach().cpu().numpy().astype(np.float32)
+    target_sr: int,
+    frame_ms: float = 30.0,
+    hop_ms: float = 10.0,
+    silence_abs_rms: float = 0.005,
+) -> torch.Tensor:
+    x = wav.squeeze(0)
+    n = x.numel()
 
-    if x.size == 0:
-        return []
+    frame_len = max(1, int(target_sr * (frame_ms / 1000.0)))
+    hop_len = max(1, int(target_sr * (hop_ms / 1000.0)))
 
-    abs_x = np.abs(x)
+    if n == 0:
+        return torch.zeros((1, 0), dtype=wav.dtype)
 
-    rms = float(np.sqrt(np.mean(x ** 2) + 1e-12))
-    if rms < 1e-8:
-        return []
+    if n < frame_len:
+        rms = torch.sqrt(torch.mean(x * x) + 1e-12)
+        if rms.item() >= silence_abs_rms:
+            return wav
+        return torch.zeros((1, 0), dtype=wav.dtype)
 
-    th_low = th_l_multiplier * rms
-    th_high = th_h_multiplier * rms
+    frames = x.unfold(0, frame_len, hop_len)
+    rms = torch.sqrt(torch.mean(frames * frames, dim=1) + 1e-12)
+    active = rms >= silence_abs_rms
 
-    above_low = abs_x > th_low
-    above_high = abs_x > th_high
+    if int(active.sum().item()) == 0:
+        return torch.zeros((1, 0), dtype=wav.dtype)
 
-    if not np.any(above_high):
-        return []
+    kept_chunks = []
+    for i in range(active.numel()):
+        if bool(active[i].item()):
+            start = i * hop_len
+            end = min(start + frame_len, n)
+            kept_chunks.append(x[start:end])
 
-    pad = max(1, int(cough_padding * sr))
-    min_len = max(1, int(min_cough_len * sr))
+    if len(kept_chunks) == 0:
+        return torch.zeros((1, 0), dtype=wav.dtype)
 
-    segments = []
-    n = len(x)
-    i = 0
-    in_event = False
-    start = 0
-
-    while i < n:
-        if not in_event:
-            if above_high[i]:
-                in_event = True
-                start = max(0, i - pad)
-        else:
-            if not above_low[i]:
-                j = i
-                while j < n and not above_low[j]:
-                    j += 1
-
-                end = min(n, i + pad)
-
-                if end - start >= min_len:
-                    seg = x[start:end]
-                    segments.append(torch.from_numpy(seg).unsqueeze(0))
-
-                in_event = False
-                i = j
-                continue
-        i += 1
-
-    if in_event:
-        end = n
-        if end - start >= min_len:
-            seg = x[start:end]
-            segments.append(torch.from_numpy(seg).unsqueeze(0))
-
-    return segments
+    out = torch.cat(kept_chunks, dim=0).unsqueeze(0)
+    return out
 
 
 def pad_or_truncate(x: torch.Tensor, window_len: int) -> torch.Tensor:
@@ -183,10 +146,61 @@ def wav_to_logmel(
     return spec.cpu()
 
 
-def make_item_id(wav_path: str, row_idx: int, segment_idx: int, window_idx: int) -> str:
-    base = f"{wav_path}|{row_idx}|{segment_idx}|{window_idx}"
+def make_item_id(wav_path: str, row_idx: int, window_idx: int) -> str:
+    base = f"{wav_path}|{row_idx}|{window_idx}"
     h = hashlib.md5(base.encode("utf-8")).hexdigest()[:16]
     return h
+
+
+def select_top_energy_windows(
+    wav: torch.Tensor,
+    starts: List[int],
+    window_len: int,
+    top_k_windows: int,
+    min_separation_ratio: float = 0.75,
+):
+    candidates = []
+
+    for s in starts:
+        chunk = wav[:, s:s + window_len]
+        chunk = pad_or_truncate(chunk, window_len)
+        energy = float(torch.mean(chunk * chunk).item())
+        candidates.append(
+            {
+                "start": int(s),
+                "energy": energy,
+                "chunk": chunk,
+            }
+        )
+
+    if len(candidates) == 0:
+        return []
+
+    candidates.sort(key=lambda x: x["energy"], reverse=True)
+
+    min_sep = int(window_len * min_separation_ratio)
+    selected = []
+
+    # greedy selection: evităm două ferestre aproape identice
+    for cand in candidates:
+        if all(abs(cand["start"] - sel["start"]) >= min_sep for sel in selected):
+            selected.append(cand)
+            if len(selected) >= top_k_windows:
+                break
+
+    # fallback: dacă nu am strâns destule, completăm fără condiția de separare
+    if len(selected) < top_k_windows:
+        used_starts = {s["start"] for s in selected}
+        for cand in candidates:
+            if cand["start"] in used_starts:
+                continue
+            selected.append(cand)
+            used_starts.add(cand["start"])
+            if len(selected) >= top_k_windows:
+                break
+
+    selected.sort(key=lambda x: x["start"])
+    return selected
 
 
 def parse_args() -> argparse.Namespace:
@@ -198,13 +212,13 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--target_sr", type=int, default=16000)
     p.add_argument("--n_mels", type=int, default=64)
-    p.add_argument("--window_seconds", type=float, default=1.5)
-    p.add_argument("--stride_seconds", type=float, default=1.5)
+    p.add_argument("--window_seconds", type=float, default=1.0)
+    p.add_argument("--stride_seconds", type=float, default=0.5)
+    p.add_argument("--silence_abs_rms", type=float, default=0.005)
 
-    p.add_argument("--cough_padding", type=float, default=0.2)
-    p.add_argument("--min_cough_len", type=float, default=0.2)
-    p.add_argument("--th_l_multiplier", type=float, default=0.1)
-    p.add_argument("--th_h_multiplier", type=float, default=2.0)
+    # cheia: păstrăm doar top-k ferestre per fișier
+    p.add_argument("--top_k_windows", type=int, default=2)
+    p.add_argument("--min_separation_ratio", type=float, default=0.75)
 
     return p.parse_args()
 
@@ -239,7 +253,7 @@ def main() -> None:
     kept_files = 0
     saved_specs = 0
     skipped_load = 0
-    skipped_no_segments = 0
+    skipped_silent = 0
     skipped_no_windows = 0
 
     for row_idx, row in df.iterrows():
@@ -248,80 +262,80 @@ def main() -> None:
         wav_path = row["wav_path"]
         label = int(row["label"])
         split = str(row["split"])
-        cough_type = str(row["cough_type"]) if "cough_type" in row else "unknown"
-        subject_id = str(row["subject_id"]) if "subject_id" in row else "unknown"
+        subject_id = str(row["subject_id"])
 
         try:
             wav, sr = safe_load_wav(wav_path)
             wav = resample_if_needed(wav, sr, target_sr)
-            wav = normalize_peak(wav)
-
-            segments = segment_cough_torch(
+            wav = remove_silence(
                 wav,
-                sr=target_sr,
-                cough_padding=float(args.cough_padding),
-                min_cough_len=float(args.min_cough_len),
-                th_l_multiplier=float(args.th_l_multiplier),
-                th_h_multiplier=float(args.th_h_multiplier),
+                target_sr=target_sr,
+                silence_abs_rms=float(args.silence_abs_rms),
             )
         except Exception:
             skipped_load += 1
             continue
 
-        if len(segments) == 0:
-            skipped_no_segments += 1
+        if wav.shape[1] == 0:
+            skipped_silent += 1
             continue
+
+        starts = window_starts_full_signal(
+            wav,
+            window_len=window_len,
+            stride_len=stride_len,
+        )
+
+        if len(starts) == 0:
+            skipped_no_windows += 1
+            continue
+
+        selected = select_top_energy_windows(
+            wav=wav,
+            starts=starts,
+            window_len=window_len,
+            top_k_windows=int(args.top_k_windows),
+            min_separation_ratio=float(args.min_separation_ratio),
+        )
+
+        if len(selected) == 0:
+            skipped_no_windows += 1
+            continue
+
+        kept_files += 1
 
         split_dir = out_root / split
         ensure_dir(split_dir)
 
-        file_saved_anything = False
+        for window_idx, item in enumerate(selected):
+            chunk = item["chunk"]
+            start = item["start"]
+            energy = item["energy"]
 
-        for seg_idx, seg_wav in enumerate(segments):
-            starts = window_starts_full_signal(
-                seg_wav,
-                window_len=window_len,
-                stride_len=stride_len,
+            spec = wav_to_logmel(chunk, mel_transform, db_transform)
+
+            item_id = make_item_id(wav_path, row_idx, window_idx)
+            spec_path = split_dir / f"{item_id}.pt"
+            torch.save(spec, spec_path)
+
+            rows_out.append(
+                {
+                    "spec_path": str(spec_path),
+                    "label": label,
+                    "split": split,
+                    "subject_id": subject_id,
+                    "source_wav": wav_path,
+                    "row_idx": int(row_idx),
+                    "window_idx": int(window_idx),
+                    "start_sample": int(start),
+                    "energy": float(energy),
+                }
             )
-
-            if len(starts) == 0:
-                continue
-
-            for window_idx, start in enumerate(starts):
-                chunk = seg_wav[:, start:start + window_len]
-                chunk = pad_or_truncate(chunk, window_len)
-
-                spec = wav_to_logmel(chunk, mel_transform, db_transform)
-
-                item_id = make_item_id(wav_path, row_idx, seg_idx, window_idx)
-                spec_path = split_dir / f"{item_id}.pt"
-                torch.save(spec, spec_path)
-
-                rows_out.append(
-                    {
-                        "spec_path": str(spec_path),
-                        "label": label,
-                        "split": split,
-                        "source_wav": wav_path,
-                        "subject_id": subject_id,
-                        "row_idx": int(row_idx),
-                        "segment_idx": int(seg_idx),
-                        "window_idx": int(window_idx),
-                        "start_sample": int(start),
-                        "cough_type": cough_type,
-                    }
-                )
-                saved_specs += 1
-                file_saved_anything = True
-
-        if file_saved_anything:
-            kept_files += 1
-        else:
-            skipped_no_windows += 1
+            saved_specs += 1
 
         if total_files % 100 == 0:
             print(
-                f"Procesate {total_files} fișiere | "
+                f"Procesate {total_files} fisiere | "
                 f"kept_files={kept_files} | saved_specs={saved_specs}"
             )
 
@@ -332,20 +346,13 @@ def main() -> None:
     out_df.to_csv(out_manifest_csv, index=False)
 
     print("\nGata.")
-    print("Fișiere totale:", total_files)
-    print("Fișiere păstrate:", kept_files)
+    print("Fisiere totale:", total_files)
+    print("Fisiere pastrate:", kept_files)
     print("Spec salvate:", saved_specs)
     print("Skipped load:", skipped_load)
-    print("Skipped no segments:", skipped_no_segments)
+    print("Skipped silent:", skipped_silent)
     print("Skipped no windows:", skipped_no_windows)
     print("Manifest spectrograme:", out_manifest_csv)
-
-    if "cough_type" in out_df.columns:
-        print("\nSpec by cough_type:")
-        print(out_df["cough_type"].value_counts())
-
-    print("\nSpec by split x label:")
-    print(pd.crosstab(out_df["split"], out_df["label"]))
 
 
 if __name__ == "__main__":

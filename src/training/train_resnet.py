@@ -5,7 +5,7 @@ import csv
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Tuple, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -144,7 +144,6 @@ def find_best_threshold(
     y_prob: np.ndarray,
     metric: str = "balanced_acc",
 ) -> float:
-    # testăm mai multe praguri între 0.05 și 0.95
     thresholds = np.linspace(0.05, 0.95, 181)
 
     best_thr = 0.5
@@ -243,10 +242,7 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--input_size", type=int, default=160)
 
-    # NOU: reducem puțin forța clasei pozitive
     p.add_argument("--pos_weight_scale", type=float, default=0.60)
-
-    # NOU: alegem pragul după balanced accuracy, nu F1
     p.add_argument(
         "--threshold_metric",
         type=str,
@@ -274,21 +270,9 @@ def main() -> None:
     out_dir = RESULTS_DIR / f"{args.backbone}_precomputed_{run_name}"
     ensure_dir(out_dir)
 
-    train_ds = PrecomputedSpecDataset(
-        spec_manifest_csv,
-        split="train",
-        augment=args.augment,
-    )
-    val_ds = PrecomputedSpecDataset(
-        spec_manifest_csv,
-        split="val",
-        augment=False,
-    )
-    test_ds = PrecomputedSpecDataset(
-        spec_manifest_csv,
-        split="test",
-        augment=False,
-    )
+    train_ds = PrecomputedSpecDataset(spec_manifest_csv, split="train", augment=args.augment)
+    val_ds = PrecomputedSpecDataset(spec_manifest_csv, split="val", augment=False)
+    test_ds = PrecomputedSpecDataset(spec_manifest_csv, split="test", augment=False)
 
     print("Train specs:", len(train_ds))
     print("Val specs:", len(val_ds))
